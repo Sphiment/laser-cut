@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import io
 import math
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Iterable
+import zipfile
 
 import ezdxf
 from ezdxf.addons.importer import Importer
@@ -64,6 +67,31 @@ class CombinedResult:
     message: str
     output: Path | None = None
     item_count: int = 0
+
+
+def clean_filename(name: str) -> str:
+    filename = Path(name).name.strip()
+    if not filename:
+        filename = "uploaded.dxf"
+    if Path(filename).suffix.lower() != ".dxf":
+        filename = f"{Path(filename).stem}.dxf"
+    return filename
+
+
+def next_input_path(input_folder: Path, source_name: str) -> Path:
+    filename = clean_filename(source_name)
+    candidate = input_folder / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    index = 2
+    while True:
+        candidate = input_folder / f"{stem}_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def discover_dxf_files(input_folder: Path) -> list[Path]:
@@ -451,6 +479,68 @@ def build_combined_dxf(
         )
 
 
+def process_dxf_sources(
+    sources: list[Path],
+    output_folder: Path,
+    combined_layout: str,
+    progress=None,
+) -> tuple[list[ConversionResult], CombinedResult]:
+    results: list[ConversionResult] = []
+
+    for index, source in enumerate(sources, start=1):
+        if progress is not None:
+            progress.progress((index - 1) / len(sources), text=f"Processing {source.name}")
+        results.append(convert_dxf(source, output_folder))
+
+    if progress is not None:
+        progress.progress(1.0, text="Building combined DXF")
+    combined_result = build_combined_dxf(results, output_folder, combined_layout)
+    if progress is not None:
+        progress.progress(1.0, text="Conversion finished")
+
+    return results, combined_result
+
+
+def output_folder_zip_bytes(output_folder: Path) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(output_folder.rglob("*.dxf")):
+            archive.write(path, path.relative_to(output_folder).as_posix())
+    return buffer.getvalue()
+
+
+def render_results(
+    results: list[ConversionResult],
+    combined_result: CombinedResult,
+    show_full_output_path: bool = True,
+) -> None:
+    converted = sum(1 for result in results if result.status == "converted")
+    skipped = sum(1 for result in results if result.status == "skipped")
+    failed = sum(1 for result in results if result.status == "failed")
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Converted", converted)
+    col_b.metric("Skipped", skipped)
+    col_c.metric("Failed", failed)
+
+    if combined_result.status == "created" and combined_result.output is not None:
+        if show_full_output_path:
+            st.success(f"{combined_result.message}: {combined_result.output}")
+        else:
+            st.success(f"{combined_result.message}; included in the download ZIP")
+    elif combined_result.status == "skipped":
+        st.warning(combined_result.message)
+    else:
+        st.error(combined_result.message)
+
+    st.subheader("Results")
+    st.dataframe(
+        result_rows(results, show_full_output_path),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def convert_dxf(source: Path, output_folder: Path) -> ConversionResult:
     try:
         doc = ezdxf.readfile(source)
@@ -551,7 +641,9 @@ def convert_dxf(source: Path, output_folder: Path) -> ConversionResult:
         )
 
 
-def result_rows(results: list[ConversionResult]) -> list[dict[str, str | int]]:
+def result_rows(
+    results: list[ConversionResult], show_full_output_path: bool = True
+) -> list[dict[str, str | int]]:
     return [
         {
             "File": result.source.name,
@@ -560,7 +652,13 @@ def result_rows(results: list[ConversionResult]) -> list[dict[str, str | int]]:
             "Final entities": result.final_entity_count,
             "Exploded": result.exploded_count,
             "Overkill removed": result.duplicate_count,
-            "Output": str(result.output) if result.output else "",
+            "Output": (
+                str(result.output)
+                if show_full_output_path and result.output
+                else result.output.name
+                if result.output
+                else ""
+            ),
             "Message": result.message,
         }
         for result in results
@@ -574,19 +672,18 @@ def render_app() -> None:
     st.caption("Batch-convert top-level DXF files for laser-cut workflows.")
 
     with st.sidebar:
-        st.header("Folders")
-        input_value = st.text_input("Input folder", placeholder=r"C:\path\to\input")
-        output_value = st.text_input("Output folder", placeholder=r"C:\path\to\output")
+        st.header("Mode")
+        mode = st.radio(
+            "Input source",
+            ["Upload files", "Local folders"],
+            index=0,
+        )
         st.header("Combined DXF")
         combined_layout = st.radio(
             "Layout",
             [COMBINED_LAYOUT_AUTO_GRID, COMBINED_LAYOUT_SINGLE_ROW],
             horizontal=True,
         )
-        run_clicked = st.button("Convert DXF files", type="primary", use_container_width=True)
-
-    input_folder = Path(input_value.strip('" ')) if input_value.strip() else None
-    output_folder = Path(output_value.strip('" ')) if output_value.strip() else None
 
     left, right = st.columns([2, 1])
     with left:
@@ -604,6 +701,68 @@ def render_app() -> None:
         st.metric("Existing files", "Add suffix")
         st.metric("Cleanup", "Explode + overkill")
         st.metric("Combined output", rf"{COMBINED_FOLDER_NAME}\{COMBINED_FILE_NAME}")
+
+    if mode == "Upload files":
+        uploaded_files = st.file_uploader(
+            "Upload DXF files",
+            type=["dxf"],
+            accept_multiple_files=True,
+        )
+        run_clicked = st.button("Convert uploaded DXF files", type="primary")
+
+        if run_clicked:
+            if not uploaded_files:
+                st.error("Upload at least one DXF file.")
+                return
+
+            with TemporaryDirectory() as temp_dir:
+                temp_root = Path(temp_dir)
+                input_folder = temp_root / "input"
+                output_folder = temp_root / "output"
+                input_folder.mkdir(parents=True, exist_ok=True)
+
+                uploaded_paths: list[Path] = []
+                for uploaded_file in uploaded_files:
+                    source_path = next_input_path(input_folder, uploaded_file.name)
+                    source_path.write_bytes(uploaded_file.getbuffer())
+                    uploaded_paths.append(source_path)
+
+                sources = sorted(uploaded_paths, key=lambda path: path.name.lower())
+                progress = st.progress(0, text="Starting conversion")
+                results, combined_result = process_dxf_sources(
+                    sources, output_folder, combined_layout, progress
+                )
+                zip_bytes = output_folder_zip_bytes(output_folder)
+
+            st.session_state["last_results"] = results
+            st.session_state["last_combined_result"] = combined_result
+            st.session_state["last_zip_bytes"] = zip_bytes
+
+        if "last_results" in st.session_state and "last_combined_result" in st.session_state:
+            render_results(
+                st.session_state["last_results"],
+                st.session_state["last_combined_result"],
+                show_full_output_path=False,
+            )
+
+        if "last_zip_bytes" in st.session_state:
+            st.download_button(
+                "Download converted DXFs",
+                data=st.session_state["last_zip_bytes"],
+                file_name="laser_cut_converted_dxf.zip",
+                mime="application/zip",
+                type="primary",
+            )
+        return
+
+    with st.sidebar:
+        st.header("Folders")
+        input_value = st.text_input("Input folder", placeholder=r"C:\path\to\input")
+        output_value = st.text_input("Output folder", placeholder=r"C:\path\to\output")
+        run_clicked = st.button("Convert DXF files", type="primary", use_container_width=True)
+
+    input_folder = Path(input_value.strip('" ')) if input_value.strip() else None
+    output_folder = Path(output_value.strip('" ')) if output_value.strip() else None
 
     if input_folder and input_folder.exists() and input_folder.is_dir():
         files = discover_dxf_files(input_folder)
@@ -628,34 +787,8 @@ def render_app() -> None:
         return
 
     progress = st.progress(0, text="Starting conversion")
-    results: list[ConversionResult] = []
-
-    for index, source in enumerate(files, start=1):
-        progress.progress((index - 1) / len(files), text=f"Processing {source.name}")
-        results.append(convert_dxf(source, output_folder))
-
-    progress.progress(1.0, text="Building combined DXF")
-    combined_result = build_combined_dxf(results, output_folder, combined_layout)
-    progress.progress(1.0, text="Conversion finished")
-
-    converted = sum(1 for result in results if result.status == "converted")
-    skipped = sum(1 for result in results if result.status == "skipped")
-    failed = sum(1 for result in results if result.status == "failed")
-
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Converted", converted)
-    col_b.metric("Skipped", skipped)
-    col_c.metric("Failed", failed)
-
-    if combined_result.status == "created" and combined_result.output is not None:
-        st.success(f"{combined_result.message}: {combined_result.output}")
-    elif combined_result.status == "skipped":
-        st.warning(combined_result.message)
-    else:
-        st.error(combined_result.message)
-
-    st.subheader("Results")
-    st.dataframe(result_rows(results), use_container_width=True, hide_index=True)
+    results, combined_result = process_dxf_sources(files, output_folder, combined_layout, progress)
+    render_results(results, combined_result)
 
 
 if __name__ == "__main__":
