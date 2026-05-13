@@ -17,7 +17,7 @@ from ezdxf.transform import inplace
 import streamlit as st
 
 
-SCALE_FACTOR = 1000.0
+SCALE_FACTOR = 2.0
 OUTPUT_SUFFIX = "_mm_scaled"
 COMBINED_FOLDER_NAME = "combined"
 COMBINED_FILE_NAME = "combine.dxf"
@@ -691,12 +691,12 @@ def render_app() -> None:
         st.write(
             "The app explodes modelspace blocks and compound entities, removes exact "
             "duplicate geometry, sets DXF units to millimeters, scales modelspace by "
-            "1000, moves the final lower-left extents to (0, 0), and saves the AutoCAD "
+            "2, moves the final lower-left extents to (0, 0), and saves the AutoCAD "
             "view zoomed to the converted extents."
         )
     with right:
         st.subheader("Settings")
-        st.metric("Scale", "1000x")
+        st.metric("Scale", "2x")
         st.metric("Layouts", "Modelspace only")
         st.metric("Existing files", "Add suffix")
         st.metric("Cleanup", "Explode + overkill")
